@@ -1,0 +1,10 @@
+---
+description:
+globs:
+alwaysApply: true
+---
+
+当前系统环境是windows，使用conda管理python环境，环境名是DigitalHuman。
+*严禁*使用linux环境的命令语法，如&&和mv，作为替代使用windows console的语法。
+在任何新启动的终端执行命令时，严格关注当前conda环境名，一般而言，需要通过conda activate启动正确的环境。
+注意：在使用uv启动*任何*MCP之前，需要启动正确的python环境！

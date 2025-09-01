@@ -1,0 +1,9 @@
+---
+description: when debugging or changing anything that already exists, and when the word debug/修改 is mentioned
+alwaysApply: false
+---
+# debug规则
+1. 阅读bug相关部分的代码，如果没有给出相关部分代码，尝试定位。
+2. 阅读bug具体描述，若未给出，向用户询问。
+3. 确定bug触发原因，如果有多个可能的原因，给出验证方案。
+4. 实际修改前，给出方案，向用户征求确认。
