@@ -94,6 +94,8 @@ import time
 import os
 from typing import Optional, Dict, List, Tuple, Union, Any
 from collections import deque
+import pymilvus
+from ABCs import InstantModule
 
 from pymilvus import (
     connections,
@@ -101,30 +103,27 @@ from pymilvus import (
     FieldSchema, CollectionSchema, DataType,
     Collection,
 )
-
-# 用于嵌入的库
-from sentence_transformers import SentenceTransformer
-
+from pymilvus.model.reranker import BGERerankFunction # 导入BGE Rerank函数
+from pymilvus.model.hybrid import BGEM3EmbeddingFunction # 导入BGE M3 Embedding函数
 
 # =========================================================================
 # 嵌入函数 (Embedding Function)
 # -------------------------------------------------------------------------
-class BGEEmbeddingFunction:
+class MilvusEmbeddingFunction:
     """
-    BAAI/bge-large-en-v1.5 嵌入函数，用于生成文本的向量嵌入。
+    使用 PyMilvus 提供的 BGEM3EmbeddingFunction 进行向量嵌入。
     """
-    def __init__(self, model_name: str = "BAAI/bge-large-en-v1.5"):
-        self.model = SentenceTransformer(model_name)
+    def __init__(self, model_name: str = "BAAI/bge-m3", device: str = "cpu", use_fp16: bool = False):
+        self.model = BGEM3EmbeddingFunction(model_name=model_name, device=device, use_fp16=use_fp16)
+        self.dim = self.model.dim # 获取嵌入维度
 
     def get_embedding(self, text: Union[str, List[str]]) -> List[List[float]]:
         """
-        生成文本的嵌入向量。
+        生成文本的密集嵌入向量。
         """
         if isinstance(text, str):
             text = [text]
-        # BGE模型通常需要添加指令
-        sentences_with_instruction = [f"Represent this sentence for searching relevant passages: {s}" for s in text]
-        embeddings = self.model.encode(sentences_with_instruction, normalize_embeddings=True).tolist()
+        embeddings = self.model.encode(text)['dense_vecs'].tolist()
         return embeddings
 
 # =========================================================================
@@ -136,7 +135,7 @@ class UserClient:
     管理特定用户的短期记忆、SQL数据库和Milvus向量数据库。
     """
     def __init__(self, user_id: str,
-                 embedding_function: BGEEmbeddingFunction,
+                 embedding_function: MilvusEmbeddingFunction,
                  sql_db_path: Optional[str] = None,
                  milvus_host: str = "localhost", milvus_port: str = "19530"):
         self.user_id = user_id
@@ -158,6 +157,9 @@ class UserClient:
         # 实例化 Milvus Collection 对象
         self.raw_text_collection: Optional[Collection] = None
         self.summary_collection: Optional[Collection] = None
+
+        # 实例化BGE Rerank函数
+        self.bge_reranker = BGERerankFunction(device="cpu") # 假设在CPU上运行，可根据需要修改为cuda
 
     def _connect_sql(self):
         """连接到SQLite数据库。"""
@@ -186,7 +188,7 @@ class UserClient:
         except Exception as e:
             print(f"Error removing Milvus connection {self.milvus_alias}: {e}")
 
-    def create_user_databases(self, initial_role: Optional[str] = None):
+    def _create_user_databases(self, initial_role: Optional[str] = None):
         """
         创建并初始化用户的SQL和Milvus数据库。
         """
@@ -217,7 +219,7 @@ class UserClient:
 
         # 连接Milvus
         self._connect_milvus()
-        vector_dim = 1024 # BGE-large-en-v1.5 模型的嵌入维度
+        vector_dim = self.embedding_function.dim # 使用嵌入函数提供的维度
 
         # 1. 定义 raw_text_embeddings 集合的 Schema
         fields_raw_text = [
@@ -260,7 +262,7 @@ class UserClient:
             print(f"Milvus collection '{self.summary_collection_name}' already exists.")
         self.summary_collection.load()
 
-    def insert_raw_dialogue_to_sql(self, role: str, text: str) -> int:
+    def _insert_raw_dialogue_to_sql(self, role: str, text: str) -> int:
         """
         向 `user_dialogues` 表插入原始对话记录。
         Args:
@@ -277,19 +279,18 @@ class UserClient:
         conn.commit()
         return cursor.lastrowid
 
-    def insert_to_milvus_raw_text(self, record_id: int, text: str):
+    def _insert_to_milvus_raw_text(self, record_id: int, embedding: List[float]):
         """
         向 `raw_text_embeddings` 集合插入原始文本的嵌入向量。
         Args:
             record_id (int): 原始对话记录在SQL中的ID。
-            text (str): 原始对话文本。
+            embedding (List[float]): 原始对话文本的嵌入向量。
         """
         if not self.raw_text_collection:
             print(f"Error: Milvus collection {self.raw_text_collection_name} not initialized.")
             return
         
         try:
-            embedding = self.embedding_function.get_embedding(text)[0] # 获取单个文本的嵌入
             data = [[record_id], [embedding]]
             self.raw_text_collection.insert(data)
             self.raw_text_collection.flush()
@@ -297,7 +298,7 @@ class UserClient:
         except Exception as e:
             print(f"Error inserting raw text record_id {record_id} to Milvus: {e}")
 
-    def insert_to_milvus_summary(self, record_id: int, start_time: int, end_time: int, summary_text: str):
+    def _insert_to_milvus_summary(self, record_id: int, start_time: int, end_time: int, summary_text: str):
         """
         向 `summary_collection` 集合插入摘要的嵌入向量和元数据。
         Args:
@@ -325,7 +326,7 @@ class UserClient:
         except Exception as e:
             print(f"Error inserting summary record_id {record_id} to Milvus: {e}")
 
-    def query_milvus_raw_text(self, query_embedding: List[float], top_k: int = 3) -> List[Dict[str, Any]]:
+    def _query_milvus_raw_text(self, query_embedding: List[float], top_k: int = 3) -> List[Dict[str, Any]]:
         """
         在 `raw_text_embeddings` 集合中执行向量搜索，并返回匹配的原始对话文本及距离。
         Args:
@@ -364,7 +365,7 @@ class UserClient:
             print(f"Error querying Milvus raw text: {e}")
             return []
 
-    def query_milvus_summary(self, query_embedding: List[float], top_k: int = 3) -> List[Dict[str, Any]]:
+    def _query_milvus_summary(self, query_embedding: List[float], top_k: int = 3) -> List[Dict[str, Any]]:
         """
         在 `summary_collection` 集合中执行向量搜索，并返回匹配的摘要文本及距离。
         Args:
@@ -402,7 +403,7 @@ class UserClient:
             print(f"Error querying Milvus summary: {e}")
             return []
 
-    def retrieve_latest_dialogues_from_sql(self, count: int = 5) -> List[Dict[str, Any]]:
+    def _retrieve_latest_dialogues_from_sql(self, count: int = 5) -> List[Dict[str, Any]]:
         """
         从 `user_dialogues` 表检索最新的对话记录。
         Args:
@@ -417,7 +418,7 @@ class UserClient:
         # Convert them to dicts for easier use
         return [dict(row) for row in cursor.fetchall()]
 
-    def retrieve_summary_from_sql(self, max_end_time: Optional[int] = None, count: int = 1) -> List[Dict[str, Any]]:
+    def _retrieve_summary_from_sql(self, max_end_time: Optional[int] = None, count: int = 1) -> List[Dict[str, Any]]:
         """
         从 `summary` 表检索摘要记录。
         Args:
@@ -440,7 +441,7 @@ class UserClient:
         cursor.execute(query, params)
         return [dict(row) for row in cursor.fetchall()]
 
-    def insert_summary_to_sql(self, start_time: int, end_time: int, summary_text: str) -> int:
+    def _insert_summary_to_sql(self, start_time: int, end_time: int, summary_text: str) -> int:
         """
         向 `summary` 表插入摘要记录。
         Args:
@@ -462,44 +463,197 @@ class UserClient:
         插入记录到SQL库，查询SQL库中时间相邻前面四条记录，五条记录一起嵌入，嵌入和id存入milvus。
         record_dict 示例: {'role': 'user', 'text': '你好'}
         """
-        # TODO 22: 实现此方法
-        pass
+        # 1. 插入记录到SQL库
+        role = record_dict.get('role')
+        text = record_dict.get('text')
+        if not role or not text:
+            print("Error: record_dict must contain 'role' and 'text'.")
+            return
+
+        record_id = self._insert_raw_dialogue_to_sql(role, text)
+        if not record_id:
+            print(f"Error: Failed to insert raw dialogue to SQL for text: {text}")
+            return
+
+        # 将原始文本添加到短期记忆
+        self.short_term_memory.append(text)
+
+        # 2. 查询SQL库中最新五条记录（包括刚刚插入的记录）
+        latest_dialogues = self._retrieve_latest_dialogues_from_sql(count=5)
+        
+        # 3. 拼接对话文本作为上下文
+        context_texts = [d['text'] for d in latest_dialogues]
+        full_context_text = " ".join(context_texts)
+
+        # 4. 生成嵌入
+        if full_context_text:
+            context_embedding = self.embedding_function.get_embedding(full_context_text)[0]
+            # 5. 将原始记录的ID和生成的嵌入向量插入到Milvus
+            self._insert_to_milvus_raw_text(record_id, context_embedding) # 传入embedding
+            print(f"Record ID {record_id} and its context embedding inserted to Milvus.")
+        else:
+            print(f"Warning: No context text to embed for record ID {record_id}.")
 
     def summarize_memory(self):
         """
         从总结库获取最大的已总结end_time，将那之后的raw text总结，假定总结的函数已经写好，然后存入总结库。
         """
-        # TODO 23: 实现此方法 (使用占位符总结函数)
-        pass
+        # 1. 从总结库获取最大的已总结end_time
+        latest_summary = self._retrieve_summary_from_sql(count=1)
+        max_end_time = latest_summary[0]['end_time'] if latest_summary else 0
+
+        # 2. 检索该end_time之后的所有原始对话记录
+        conn = self._connect_sql()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, time, role, text FROM user_dialogues WHERE time > ? ORDER BY time ASC;", (max_end_time,))
+        raw_dialogues_to_summarize = [dict(row) for row in cursor.fetchall()]
+
+        if not raw_dialogues_to_summarize:
+            print("No new raw dialogues to summarize.")
+            return
+
+        # 3. 拼接对话文本并进行总结
+        texts_to_summarize = [d['text'] for d in raw_dialogues_to_summarize]
+        full_text_to_summarize = " ".join(texts_to_summarize)
+
+        # 使用占位符总结函数
+        # TODO: 替换为实际的LLM总结函数
+        summarized_text = _summarize_placeholder_func(full_text_to_summarize)
+
+        # 获取总结的开始和结束时间
+        summary_start_time = raw_dialogues_to_summarize[0]['time']
+        summary_end_time = raw_dialogues_to_summarize[-1]['time']
+
+        # 4. 将总结结果插入到SQL summary表
+        summary_id = self._insert_summary_to_sql(summary_start_time, summary_end_time, summarized_text)
+        if not summary_id:
+            print(f"Error: Failed to insert summary to SQL for text: {summarized_text}")
+            return
+
+        # 5. 将总结结果插入到Milvus summary_collection
+        self._insert_to_milvus_summary(summary_id, summary_start_time, summary_end_time, summarized_text)
+        print(f"Summary ID {summary_id} inserted to SQL and Milvus.")
 
     def query_raw_memory(self, query_data: Union[str, List[str], List[float]], top_k: int = 3) -> List[Dict[str, Any]]:
         """
         查询相关原始记忆。
         可以接受输入向量或list或文本，但前面这些至少有一个，接受top k默认3。
         """
-        # TODO 24: 实现此方法
-        pass
+        query_embedding: Optional[List[float]] = None
+        results: List[Dict[str, Any]] = []
+        query_text: Optional[str] = None # 用于Rerank的原始查询文本
+
+        if isinstance(query_data, list) and all(isinstance(i, float) for i in query_data):
+            # 如果是向量，直接用向量在raw text里面查询
+            query_embedding = query_data
+            results = self._query_milvus_raw_text(query_embedding, top_k=top_k)
+        elif isinstance(query_data, list) and all(isinstance(i, str) for i in query_data):
+            # 如果是list，假定该list是上下文，嵌入后查询
+            query_text = " ".join(query_data)
+            query_embedding = self.embedding_function.get_embedding(query_text)[0]
+            results = self._query_milvus_raw_text(query_embedding, top_k=top_k)
+        elif isinstance(query_data, str):
+            # 如果是文本，假定是一句话
+            query_text = query_data
+            conn = self._connect_sql()
+            cursor = conn.cursor()
+
+            # 尝试从SQL里面做完全匹配
+            cursor.execute("SELECT id, text FROM user_dialogues WHERE text = ?;", (query_data,))
+            sql_match = cursor.fetchone()
+
+            if sql_match:
+                # 如果匹配到，根据ID查询Milvus
+                matched_id = sql_match['id']
+                # 生成匹配文本的嵌入，然后进行单次top_k=1的查询来模拟
+                query_embedding = self.embedding_function.get_embedding(query_data)[0]
+                results = self._query_milvus_raw_text(query_embedding, top_k=top_k) 
+                results = [r for r in results if r['id'] == matched_id]
+            else:
+                # 如果匹配不到，假定是下一句话，用SQL里面最新四句跟这一句嵌入后查询
+                latest_dialogues = self._retrieve_latest_dialogues_from_sql(count=4)
+                context_texts = [d['text'] for d in latest_dialogues]
+                context_texts.append(query_data) # 将新查询文本也加入上下文
+                full_context_text = " ".join(context_texts)
+                query_embedding = self.embedding_function.get_embedding(full_context_text)[0]
+                results = self._query_milvus_raw_text(query_embedding, top_k=top_k)
+        else:
+            print("Error: Unsupported query_data type.")
+            return []
+
+        # Rerank，除非k=1 并且有原始query_text
+        if query_text and top_k > 1 and results:
+            documents_for_rerank = [r['text'] for r in results]
+            reranked_results = self.bge_reranker.rerank(query_text, documents_for_rerank, top_k=top_k)
+            
+            # 根据rerank结果重新构建原始results列表
+            final_results = []
+            for r_result in reranked_results:
+                original_index = r_result.index
+                original_doc = results[original_index]
+                original_doc['distance'] = 1 - r_result.score # 将score转换为距离度量
+                final_results.append(original_doc)
+            return final_results
+        
+        return results
 
     def query_summary_memory(self, query_data: Union[str, List[str], List[float]], top_k: int = 3) -> List[Dict[str, Any]]:
         """
         查询相关总结记忆。
         """
-        # TODO 25: 实现此方法
-        pass
+        query_embedding: Optional[List[float]] = None
+        results: List[Dict[str, Any]] = []
+        query_text: Optional[str] = None # 用于Rerank的原始查询文本
 
-class MemoryModule:
+        if isinstance(query_data, list) and all(isinstance(i, float) for i in query_data):
+            # 如果是向量，直接用向量在summary collection里面查询
+            query_embedding = query_data
+            results = self._query_milvus_summary(query_embedding, top_k=top_k)
+        elif isinstance(query_data, list) and all(isinstance(i, str) for i in query_data):
+            # 如果是list，假定该list是上下文，嵌入后查询
+            query_text = " ".join(query_data)
+            query_embedding = self.embedding_function.get_embedding(query_text)[0]
+            results = self._query_milvus_summary(query_embedding, top_k=top_k)
+        elif isinstance(query_data, str):
+            # 如果是文本，假定是一句话，嵌入后查询
+            query_text = query_data
+            query_embedding = self.embedding_function.get_embedding(query_text)[0]
+            results = self._query_milvus_summary(query_embedding, top_k=top_k)
+        else:
+            print("Error: Unsupported query_data type.")
+            return []
+        
+        # Rerank，除非k=1 并且有原始query_text
+        if query_text and top_k > 1 and results:
+            documents_for_rerank = [r['summary_text'] for r in results]
+            reranked_results = self.bge_reranker.rerank(query_text, documents_for_rerank, top_k=top_k)
+
+            # 根据rerank结果重新构建原始results列表
+            final_results = []
+            for r_result in reranked_results:
+                original_index = r_result.index
+                original_doc = results[original_index]
+                original_doc['distance'] = 1 - r_result.score # 将score转换为距离度量
+                final_results.append(original_doc)
+            return final_results
+
+        return results
+
+class MemoryModule(InstantModule):
     """
     记忆模块的整体实例，管理所有用户的UserClient实例。
     """
     def __init__(self, milvus_host: str = "localhost", milvus_port: str = "19530"):
+        super().__init__() # 调用父类的__init__方法
         self.user_clients: Dict[str, UserClient] = {}
-        self.embedding_function = BGEEmbeddingFunction() # 所有客户端共享同一个嵌入函数实例
         self.milvus_host = milvus_host
         self.milvus_port = milvus_port
-        
-        # 建立全局Milvus连接，用于管理连接和utility操作
-        connections.connect(alias="default", host=self.milvus_host, port=self.milvus_port)
 
+    async def _setup(self):
+        # 建立全局Milvus连接，用于管理连接和utility操作
+        if not self._is_ready.is_set():
+            connections.connect(alias="default", host=self.milvus_host, port=self.milvus_port)
+            self._is_ready.set()
 
     def start_user_client_instance(self, user_id: str) -> UserClient:
         """
@@ -509,16 +663,39 @@ class MemoryModule:
             print(f"UserClient for {user_id} already exists. Returning existing instance.")
             return self.user_clients[user_id]
         
+        # 在这里实例化 MilvusEmbeddingFunction，并传递给 UserClient
+        embedding_function_instance = MilvusEmbeddingFunction(
+            model_name='BAAI/bge-m3',
+            device='cpu',
+            use_fp16=False
+        )
+        
         client = UserClient(user_id=user_id,
-                            embedding_function=self.embedding_function,
+                            embedding_function=embedding_function_instance,
                             milvus_host=self.milvus_host,
                             milvus_port=self.milvus_port)
         self.user_clients[user_id] = client
         
         # 自动创建数据库
-        client.create_user_databases()
+        client._create_user_databases()
         
         return client
+
+    async def shutdown(self):
+        """
+        关闭记忆模块，包括所有用户客户端和全局Milvus连接。
+        """
+        # 关闭所有活跃的用户客户端
+        for user_id in list(self.user_clients.keys()):
+            self.close_user_client_instance(user_id)
+        
+        # 移除全局Milvus连接
+        try:
+            if "default" in connections.list_connections():
+                connections.remove_connection("default")
+                print("Global Milvus connection 'default' removed.")
+        except Exception as e:
+            print(f"Error removing global Milvus connection: {e}")
 
     def close_user_client_instance(self, user_id: str):
         """
