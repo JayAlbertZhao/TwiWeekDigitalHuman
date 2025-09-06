@@ -11,7 +11,7 @@ InputModule 测试文件
 
 import json
 import os
-from ..input_module import InputModule
+from src.input_module import InputModule
 
 
 def test_basic_functionality():

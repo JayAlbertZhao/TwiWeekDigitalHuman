@@ -7,7 +7,7 @@ InputModule 使用示例
 3. 与记忆管理模块集成
 """
 
-from input_module import InputModule
+from src.input_module import InputModule
 
 
 def basic_example():
