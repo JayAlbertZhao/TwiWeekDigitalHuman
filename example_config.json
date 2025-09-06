@@ -1,0 +1,52 @@
+{
+    "context_template": [
+        {
+            "module_name": "system_prompt",
+            "segments": [
+                {"type": "text", "value": "你是一个专业的AI助手，具有以下特点：\n1. 知识渊博，能够回答各种问题\n2. 语言表达清晰准确\n3. 能够记住对话历史\n4. 会根据上下文提供连贯的回答\n\n请根据以下信息回答用户的问题："}
+            ],
+            "importance_func": true
+        },
+        {
+            "module_name": "short_term_memory",
+            "segments": [
+                {"type": "text", "value": "\n=== 最近的对话历史 ===\n"},
+                {"type": "variable", "value": "short_term_history_content"},
+                {"type": "text", "value": "\n==================\n"}
+            ],
+            "importance_func": true
+        },
+        {
+            "module_name": "long_term_memory",
+            "segments": [
+                {"type": "text", "value": "\n=== 相关的长期记忆 ===\n"},
+                {"type": "variable", "value": "long_term_memory_content"},
+                {"type": "text", "value": "\n==================\n"}
+            ],
+            "importance_func": "is_relevant_long_term_memory"
+        },
+        {
+            "module_name": "user_input",
+            "segments": [
+                {"type": "text", "value": "\n=== 当前用户输入 ===\n"},
+                {"type": "variable", "value": "current_user_input"},
+                {"type": "text", "value": "\n==================\n"}
+            ],
+            "importance_func": true
+        },
+        {
+            "module_name": "context_instruction",
+            "segments": [
+                {"type": "text", "value": "\n请基于以上信息，为用户提供准确、有用的回答。如果用户询问之前讨论过的话题，请参考对话历史；如果用户询问专业知识，请结合长期记忆中的相关信息。"}
+            ],
+            "importance_func": true
+        }
+    ],
+    "settings": {
+        "max_short_term_memory": 10,
+        "max_long_term_memory_results": 5,
+        "prompt_separator": "\n\n",
+        "enable_debug_logging": false
+    }
+}
+

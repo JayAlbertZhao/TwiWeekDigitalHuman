@@ -1,0 +1,15 @@
+# InputModule 依赖包
+# 基础依赖
+typing-extensions>=4.0.0
+
+# 可选依赖（用于高级功能）
+# 如果需要更复杂的JSON处理
+# jsonschema>=3.2.0
+
+# 如果需要更好的日志配置
+# colorlog>=6.7.0
+
+# 开发依赖（可选）
+# pytest>=7.0.0
+# pytest-cov>=4.0.0
+
